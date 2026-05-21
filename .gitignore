@@ -1,0 +1,46 @@
+# Hệ điều hành & IDE
+.DS_Store
+.DS_Store?
+._*
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.sln
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- FRONTEND (React/Vite) ---
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+frontend/vite.config.js.timestamp-*
+frontend/.gitignore
+
+# --- BACKEND (FastAPI/Python) ---
+backend/venv/
+backend/.venv/
+backend/env/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backend/.env
+
+# Các file test chạy thử của hệ thống (nếu có)
+backend/test_asyncpg_log.py
+backend/test_monkey.py
+backend/test_trigger_log.py
+
+# --- FILE TÀI LIỆU CÁ NHÂN ---
+# Bỏ qua các file đề bài / ghi chú text tải về (nếu bạn muốn)
+# DoAn_UdeLearning.txt
+# UdeLearning (1).txt

@@ -1,0 +1,1643 @@
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- =========================================================
+-- Core helper: auto touch updated_at
+-- =========================================================
+CREATE OR REPLACE FUNCTION fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =========================
+-- 1) USERS & ROLES + AUTH
+-- =========================
+CREATE TABLE IF NOT EXISTS users (
+    id                  BIGSERIAL PRIMARY KEY,
+    email               CITEXT UNIQUE NOT NULL,
+    password_hash       TEXT,
+    full_name           TEXT NOT NULL,
+    avatar              TEXT,
+    status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'banned', 'pending_verification', 'deleted')),
+    email_verified_at   TIMESTAMPTZ,
+    last_login_at       TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at          TIMESTAMPTZ,
+    CONSTRAINT chk_password_or_verified_external CHECK (
+        password_hash IS NOT NULL OR status IN ('pending_verification', 'deleted')
+    )
+);
+
+DROP TRIGGER IF EXISTS trg_users_set_updated_at ON users;
+CREATE TRIGGER trg_users_set_updated_at
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS roles (
+    id                  BIGSERIAL PRIMARY KEY,
+    name                TEXT UNIQUE NOT NULL CHECK (name IN ('student', 'instructor', 'admin')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id             BIGINT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, role_id)
+);
+
+INSERT INTO roles(name)
+VALUES ('student'), ('instructor'), ('admin')
+ON CONFLICT (name) DO NOTHING;
+
+-- OAuth/external provider support (optional)
+CREATE TABLE IF NOT EXISTS user_auth_providers (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider            TEXT NOT NULL CHECK (provider IN ('google', 'facebook', 'github', 'apple')),
+    provider_user_id    TEXT NOT NULL,
+    provider_email      CITEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, provider_user_id)
+);
+
+-- Persistent sessions with refresh token hash
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id                      BIGSERIAL PRIMARY KEY,
+    user_id                 BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    refresh_token_hash      TEXT NOT NULL UNIQUE,
+    device_id               TEXT,
+    ip_address              INET,
+    user_agent              TEXT,
+    is_revoked              BOOLEAN NOT NULL DEFAULT FALSE,
+    revoked_at              TIMESTAMPTZ,
+    expires_at              TIMESTAMPTZ NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (expires_at > created_at)
+);
+
+DROP TRIGGER IF EXISTS trg_auth_sessions_set_updated_at ON auth_sessions;
+CREATE TRIGGER trg_auth_sessions_set_updated_at
+BEFORE UPDATE ON auth_sessions
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_active
+ON auth_sessions(user_id, is_revoked, expires_at DESC);
+
+-- Email verification tokens (store hash, not raw token)
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash          TEXT NOT NULL UNIQUE,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    used_at             TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (expires_at > created_at)
+);
+
+-- Password reset tokens (store hash, not raw token)
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash          TEXT NOT NULL UNIQUE,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    used_at             TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (expires_at > created_at)
+);
+
+-- Login attempt tracking for brute-force defense
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    email               CITEXT,
+    ip_address          INET,
+    is_success          BOOLEAN NOT NULL,
+    reason              TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_attempts_email_created_at
+ON login_attempts(email, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS auth_audit_logs (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    session_id          BIGINT REFERENCES auth_sessions(id) ON DELETE SET NULL,
+    action              TEXT NOT NULL CHECK (action IN (
+        'register', 'verify_email', 'login_success', 'login_failed',
+        'password_reset_request', 'password_reset_success', 'logout',
+        'refresh_token_rotated', 'account_locked', 'account_reactivated'
+    )),
+    ip_address          INET,
+    metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Wallet: mỗi user có 1 ví nội bộ
+CREATE TABLE IF NOT EXISTS wallets (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    balance             NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (balance >= 0),
+    currency            CHAR(3) NOT NULL DEFAULT 'VND',
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_wallets_set_updated_at ON wallets;
+CREATE TRIGGER trg_wallets_set_updated_at
+BEFORE UPDATE ON wallets
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id                  BIGSERIAL PRIMARY KEY,
+    wallet_id           BIGINT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    tx_type             TEXT NOT NULL CHECK (tx_type IN ('topup', 'purchase', 'refund', 'adjustment')),
+    direction           TEXT NOT NULL CHECK (direction IN ('credit', 'debit')),
+    amount              NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+    balance_before      NUMERIC(14,2) NOT NULL CHECK (balance_before >= 0),
+    balance_after       NUMERIC(14,2) NOT NULL CHECK (balance_after >= 0),
+    status              TEXT NOT NULL DEFAULT 'success' CHECK (status IN ('pending', 'success', 'failed')),
+    ref_type            TEXT,
+    ref_id              BIGINT,
+    description         TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_created
+ON wallet_transactions(wallet_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS wallet_topups (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount              NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+    method              TEXT NOT NULL CHECK (method IN ('card', 'momo', 'bank_transfer', 'crypto')),
+    provider            TEXT,
+    provider_txn_id     TEXT,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'failed', 'cancelled')),
+    paid_at             TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, provider_txn_id)
+);
+
+DROP TRIGGER IF EXISTS trg_wallet_topups_set_updated_at ON wallet_topups;
+CREATE TRIGGER trg_wallet_topups_set_updated_at
+BEFORE UPDATE ON wallet_topups
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wallet_tx_topup_credit_once
+ON wallet_transactions(ref_type, ref_id, direction)
+WHERE ref_type = 'wallet_topup' AND direction = 'credit' AND status = 'success';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wallet_tx_payment_debit_once
+ON wallet_transactions(ref_type, ref_id, direction)
+WHERE ref_type = 'payment' AND direction = 'debit' AND status = 'success';
+
+CREATE OR REPLACE FUNCTION fn_create_wallet_for_user()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO wallets(user_id, currency, balance)
+    VALUES (NEW.id, 'VND', 0)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_create_wallet_for_user ON users;
+CREATE TRIGGER trg_create_wallet_for_user
+AFTER INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION fn_create_wallet_for_user();
+
+-- Backfill ví cho user đã có sẵn
+INSERT INTO wallets(user_id, currency, balance)
+SELECT u.id, 'VND', 0
+FROM users u
+ON CONFLICT (user_id) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION fn_apply_wallet_topup()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_wallet_id BIGINT;
+    v_balance_before NUMERIC(14,2);
+    v_balance_after NUMERIC(14,2);
+BEGIN
+    IF NEW.status <> 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status = 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT id, balance
+    INTO v_wallet_id, v_balance_before
+    FROM wallets
+    WHERE user_id = NEW.user_id
+    FOR UPDATE;
+
+    IF v_wallet_id IS NULL THEN
+        RAISE EXCEPTION 'Wallet not found for user %', NEW.user_id;
+    END IF;
+
+    UPDATE wallets
+    SET balance = balance + NEW.amount,
+        updated_at = NOW()
+    WHERE id = v_wallet_id;
+
+    v_balance_after := v_balance_before + NEW.amount;
+
+    INSERT INTO wallet_transactions(
+        wallet_id, tx_type, direction, amount, balance_before, balance_after,
+        status, ref_type, ref_id, description, created_at
+    )
+    VALUES (
+        v_wallet_id, 'topup', 'credit', NEW.amount, v_balance_before, v_balance_after,
+        'success', 'wallet_topup', NEW.id, 'Nạp tiền vào ví', NOW()
+    )
+    ON CONFLICT DO NOTHING;
+
+    IF NEW.paid_at IS NULL THEN
+        UPDATE wallet_topups
+        SET paid_at = NOW(),
+            updated_at = NOW()
+        WHERE id = NEW.id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_apply_wallet_topup ON wallet_topups;
+CREATE TRIGGER trg_apply_wallet_topup
+AFTER INSERT OR UPDATE OF status ON wallet_topups
+FOR EACH ROW
+EXECUTE FUNCTION fn_apply_wallet_topup();
+
+-- =========================
+-- 2) COURSE SYSTEM
+-- =========================
+CREATE TABLE IF NOT EXISTS courses (
+    id                  BIGSERIAL PRIMARY KEY,
+    title               TEXT NOT NULL,
+    description         TEXT,
+    price               NUMERIC(12,2) NOT NULL CHECK (price >= 0),
+    level               TEXT NOT NULL CHECK (level IN ('beginner', 'intermediate', 'advanced')),
+    instructor_id       BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    status              TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'review', 'published', 'archived')),
+    rating_avg          NUMERIC(3,2) NOT NULL DEFAULT 0,
+    published_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at          TIMESTAMPTZ
+);
+
+DROP TRIGGER IF EXISTS trg_courses_set_updated_at ON courses;
+CREATE TRIGGER trg_courses_set_updated_at
+BEFORE UPDATE ON courses
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS course_sections (
+    id                  BIGSERIAL PRIMARY KEY,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    title               TEXT NOT NULL,
+    order_index         INT NOT NULL CHECK (order_index >= 1),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (course_id, order_index)
+);
+
+DROP TRIGGER IF EXISTS trg_course_sections_set_updated_at ON course_sections;
+CREATE TRIGGER trg_course_sections_set_updated_at
+BEFORE UPDATE ON course_sections
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS lessons (
+    id                  BIGSERIAL PRIMARY KEY,
+    section_id          BIGINT NOT NULL REFERENCES course_sections(id) ON DELETE CASCADE,
+    title               TEXT NOT NULL,
+    video_url           TEXT,
+    duration            INT NOT NULL DEFAULT 0 CHECK (duration >= 0),
+    order_index         INT NOT NULL CHECK (order_index >= 1),
+    is_preview          BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at          TIMESTAMPTZ,
+    UNIQUE (section_id, order_index)
+);
+
+DROP TRIGGER IF EXISTS trg_lessons_set_updated_at ON lessons;
+CREATE TRIGGER trg_lessons_set_updated_at
+BEFORE UPDATE ON lessons
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS lesson_resources (
+    id                  BIGSERIAL PRIMARY KEY,
+    lesson_id           BIGINT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    type                TEXT NOT NULL CHECK (type IN ('pdf', 'file', 'link')),
+    url                 TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_lesson_resources_set_updated_at ON lesson_resources;
+CREATE TRIGGER trg_lesson_resources_set_updated_at
+BEFORE UPDATE ON lesson_resources
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =========================
+-- 3) PAYMENT & ORDER
+-- =========================
+CREATE TABLE IF NOT EXISTS coupons (
+    id                  BIGSERIAL PRIMARY KEY,
+    code                TEXT UNIQUE NOT NULL,
+    discount_percent    NUMERIC(5,2) NOT NULL CHECK (discount_percent > 0 AND discount_percent <= 100),
+    max_uses            INT CHECK (max_uses IS NULL OR max_uses > 0),
+    used_count          INT NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    expiry_date         TIMESTAMPTZ NOT NULL,
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_coupons_set_updated_at ON coupons;
+CREATE TRIGGER trg_coupons_set_updated_at
+BEFORE UPDATE ON coupons
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS orders (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    coupon_id           BIGINT REFERENCES coupons(id) ON DELETE SET NULL,
+    subtotal_amount     NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (subtotal_amount >= 0),
+    discount_amount     NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
+    total_amount        NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+    currency            CHAR(3) NOT NULL DEFAULT 'VND',
+    status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'partial_refunded', 'refunded', 'cancelled', 'expired')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paid_at             TIMESTAMPTZ,
+    CHECK (subtotal_amount >= discount_amount),
+    CHECK (total_amount = subtotal_amount - discount_amount)
+);
+
+-- Chuẩn hóa constraint trạng thái cho bảng orders đã tồn tại từ phiên bản cũ
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'orders_status_check'
+          AND conrelid = 'orders'::regclass
+    ) THEN
+        ALTER TABLE orders DROP CONSTRAINT orders_status_check;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_orders_status'
+          AND conrelid = 'orders'::regclass
+    ) THEN
+        ALTER TABLE orders
+            ADD CONSTRAINT chk_orders_status
+            CHECK (status IN ('pending', 'paid', 'partial_refunded', 'refunded', 'cancelled', 'expired'));
+    END IF;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_orders_set_updated_at ON orders;
+CREATE TRIGGER trg_orders_set_updated_at
+BEFORE UPDATE ON orders
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS order_items (
+    id                  BIGSERIAL PRIMARY KEY,
+    order_id            BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE RESTRICT,
+    price               NUMERIC(12,2) NOT NULL CHECK (price >= 0),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (order_id, course_id)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id                  BIGSERIAL PRIMARY KEY,
+    order_id            BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    method              TEXT NOT NULL CHECK (method IN ('wallet')),
+    provider            TEXT,
+    provider_txn_id     TEXT,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'failed', 'partial_refunded', 'refunded')),
+    amount              NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+    paid_at             TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, provider_txn_id)
+);
+
+-- Chuẩn hóa constraint cho bảng đã tồn tại từ phiên bản cũ
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'payments_method_check'
+          AND conrelid = 'payments'::regclass
+    ) THEN
+        ALTER TABLE payments DROP CONSTRAINT payments_method_check;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'payments_status_check'
+          AND conrelid = 'payments'::regclass
+    ) THEN
+        ALTER TABLE payments DROP CONSTRAINT payments_status_check;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_payments_method_wallet'
+          AND conrelid = 'payments'::regclass
+    ) THEN
+        ALTER TABLE payments
+            ADD CONSTRAINT chk_payments_method_wallet
+            CHECK (method IN ('wallet'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_payments_status'
+          AND conrelid = 'payments'::regclass
+    ) THEN
+        ALTER TABLE payments
+            ADD CONSTRAINT chk_payments_status
+            CHECK (status IN ('pending', 'paid', 'failed', 'partial_refunded', 'refunded'));
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS payment_refunds (
+    id                  BIGSERIAL PRIMARY KEY,
+    payment_id          BIGINT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    requested_by        BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    approved_by         BIGINT REFERENCES users(id) ON DELETE RESTRICT,
+    amount              NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+    reason              TEXT NOT NULL,
+    refund_mode         TEXT NOT NULL DEFAULT 'keep_access' CHECK (refund_mode IN ('keep_access', 'revoke_access')),
+    status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'processed')),
+    processed_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_payment_refunds_set_updated_at ON payment_refunds;
+CREATE TRIGGER trg_payment_refunds_set_updated_at
+BEFORE UPDATE ON payment_refunds
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_payments_set_updated_at ON payments;
+CREATE TRIGGER trg_payments_set_updated_at
+BEFORE UPDATE ON payments
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_one_paid_per_order
+ON payments(order_id) WHERE status = 'paid';
+
+CREATE OR REPLACE FUNCTION fn_normalize_wallet_payment()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.method <> 'wallet' THEN
+        RAISE EXCEPTION 'Only wallet payment method is allowed';
+    END IF;
+
+    NEW.provider := COALESCE(NULLIF(TRIM(NEW.provider), ''), 'wallet_core');
+
+    IF NEW.provider_txn_id IS NULL OR LENGTH(TRIM(NEW.provider_txn_id)) = 0 THEN
+        NEW.provider_txn_id := CONCAT('wallet_', gen_random_uuid()::TEXT);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_normalize_wallet_payment ON payments;
+CREATE TRIGGER trg_normalize_wallet_payment
+BEFORE INSERT OR UPDATE OF method, provider, provider_txn_id ON payments
+FOR EACH ROW
+EXECUTE FUNCTION fn_normalize_wallet_payment();
+
+CREATE OR REPLACE FUNCTION fn_process_wallet_payment()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_user_id BIGINT;
+    v_order_total NUMERIC(12,2);
+    v_wallet_id BIGINT;
+    v_wallet_currency CHAR(3);
+    v_wallet_balance NUMERIC(14,2);
+    v_order_currency CHAR(3);
+BEGIN
+    IF NEW.method <> 'wallet' OR NEW.status <> 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status = 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT o.user_id, o.total_amount, o.currency
+    INTO v_user_id, v_order_total, v_order_currency
+    FROM orders o
+    WHERE o.id = NEW.order_id;
+
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Order % not found for wallet payment', NEW.order_id;
+    END IF;
+
+    IF NEW.amount <> v_order_total THEN
+        RAISE EXCEPTION 'Wallet payment amount % must equal order total %', NEW.amount, v_order_total;
+    END IF;
+
+    SELECT w.id, w.currency, w.balance
+    INTO v_wallet_id, v_wallet_currency, v_wallet_balance
+    FROM wallets w
+    WHERE w.user_id = v_user_id
+      AND w.is_active = TRUE
+    FOR UPDATE;
+
+    IF v_wallet_id IS NULL THEN
+        RAISE EXCEPTION 'Active wallet not found for user %', v_user_id;
+    END IF;
+
+    IF v_wallet_currency <> v_order_currency THEN
+        RAISE EXCEPTION 'Currency mismatch: wallet % vs order %', v_wallet_currency, v_order_currency;
+    END IF;
+
+    IF v_wallet_balance < NEW.amount THEN
+        RAISE EXCEPTION 'Insufficient wallet balance: need %, have %', NEW.amount, v_wallet_balance;
+    END IF;
+
+    UPDATE wallets
+    SET balance = balance - NEW.amount,
+        updated_at = NOW()
+    WHERE id = v_wallet_id;
+
+    INSERT INTO wallet_transactions(
+        wallet_id, tx_type, direction, amount, balance_before, balance_after,
+        status, ref_type, ref_id, description, created_at
+    )
+    VALUES (
+        v_wallet_id,
+        'purchase',
+        'debit',
+        NEW.amount,
+        v_wallet_balance,
+        v_wallet_balance - NEW.amount,
+        'success',
+        'payment',
+        NEW.id,
+        'Thanh toán đơn hàng bằng ví',
+        NOW()
+    )
+    ON CONFLICT DO NOTHING;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_process_wallet_payment ON payments;
+CREATE TRIGGER trg_process_wallet_payment
+BEFORE INSERT OR UPDATE OF status ON payments
+FOR EACH ROW
+EXECUTE FUNCTION fn_process_wallet_payment();
+
+-- =========================
+-- 4) INSTRUCTOR SYSTEM
+-- =========================
+CREATE TABLE IF NOT EXISTS instructor_profiles (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    bio                 TEXT,
+    rating_avg          NUMERIC(3,2) NOT NULL DEFAULT 0,
+    total_students      INT NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_instructor_profiles_set_updated_at ON instructor_profiles;
+CREATE TRIGGER trg_instructor_profiles_set_updated_at
+BEFORE UPDATE ON instructor_profiles
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS instructor_earnings (
+    id                  BIGSERIAL PRIMARY KEY,
+    instructor_id       BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    payment_id          BIGINT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE RESTRICT,
+    amount              NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+    system_amount       NUMERIC(12,2) NOT NULL CHECK (system_amount >= 0),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (payment_id, course_id)
+);
+
+-- =========================
+-- 5) ENROLLMENT & PROGRESS
+-- =========================
+CREATE TABLE IF NOT EXISTS enrollments (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    enrolled_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source              TEXT NOT NULL DEFAULT 'payment' CHECK (source IN ('payment', 'admin', 'gift', 'promo')),
+    UNIQUE (user_id, course_id)
+);
+
+CREATE TABLE IF NOT EXISTS lesson_progress (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lesson_id           BIGINT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    is_completed        BOOLEAN NOT NULL DEFAULT FALSE,
+    last_watched_time   INT NOT NULL DEFAULT 0 CHECK (last_watched_time >= 0),
+    completed_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, lesson_id)
+);
+
+DROP TRIGGER IF EXISTS trg_lesson_progress_set_updated_at ON lesson_progress;
+CREATE TRIGGER trg_lesson_progress_set_updated_at
+BEFORE UPDATE ON lesson_progress
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS course_progress (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    progress_percent    NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, course_id)
+);
+
+DROP TRIGGER IF EXISTS trg_course_progress_set_updated_at ON course_progress;
+CREATE TRIGGER trg_course_progress_set_updated_at
+BEFORE UPDATE ON course_progress
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =========================
+-- 6) QUIZ SYSTEM
+-- =========================
+CREATE TABLE IF NOT EXISTS quizzes (
+    id                  BIGSERIAL PRIMARY KEY,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    title               TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_quizzes_set_updated_at ON quizzes;
+CREATE TRIGGER trg_quizzes_set_updated_at
+BEFORE UPDATE ON quizzes
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS questions (
+    id                  BIGSERIAL PRIMARY KEY,
+    quiz_id             BIGINT NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+    content             TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_questions_set_updated_at ON questions;
+CREATE TRIGGER trg_questions_set_updated_at
+BEFORE UPDATE ON questions
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS answers (
+    id                  BIGSERIAL PRIMARY KEY,
+    question_id         BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    content             TEXT NOT NULL,
+    is_correct          BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_answers_set_updated_at ON answers;
+CREATE TRIGGER trg_answers_set_updated_at
+BEFORE UPDATE ON answers
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS quiz_attempts (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    quiz_id             BIGINT NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+    score               NUMERIC(5,2) NOT NULL DEFAULT 0,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    submitted_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS attempt_answers (
+    id                  BIGSERIAL PRIMARY KEY,
+    attempt_id          BIGINT REFERENCES quiz_attempts(id) ON DELETE CASCADE,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    quiz_id             BIGINT NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
+    question_id         BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    selected_answer_id  BIGINT NOT NULL REFERENCES answers(id) ON DELETE CASCADE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (attempt_id, question_id)
+);
+
+-- =========================
+-- 7) REVIEW & RATING
+-- =========================
+CREATE TABLE IF NOT EXISTS reviews (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    rating              INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment             TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, course_id)
+);
+
+DROP TRIGGER IF EXISTS trg_reviews_set_updated_at ON reviews;
+CREATE TRIGGER trg_reviews_set_updated_at
+BEFORE UPDATE ON reviews
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =========================
+-- 8) Q&A SYSTEM
+-- =========================
+CREATE TABLE IF NOT EXISTS questions_discussion (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    content             TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_questions_discussion_set_updated_at ON questions_discussion;
+CREATE TRIGGER trg_questions_discussion_set_updated_at
+BEFORE UPDATE ON questions_discussion
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TABLE IF NOT EXISTS answers_discussion (
+    id                  BIGSERIAL PRIMARY KEY,
+    question_id         BIGINT NOT NULL REFERENCES questions_discussion(id) ON DELETE CASCADE,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content             TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_answers_discussion_set_updated_at ON answers_discussion;
+CREATE TRIGGER trg_answers_discussion_set_updated_at
+BEFORE UPDATE ON answers_discussion
+FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =========================
+-- 9) CATEGORY & TAG
+-- =========================
+CREATE TABLE IF NOT EXISTS categories (
+    id                  BIGSERIAL PRIMARY KEY,
+    name                TEXT UNIQUE NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS course_categories (
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    category_id         BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (course_id, category_id)
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id                  BIGSERIAL PRIMARY KEY,
+    name                TEXT UNIQUE NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS course_tags (
+    course_id           BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    tag_id              BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (course_id, tag_id)
+);
+
+-- =========================
+-- 10) TRACKING & ANALYTICS
+-- =========================
+CREATE TABLE IF NOT EXISTS watch_history (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lesson_id           BIGINT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    watched_time        INT NOT NULL DEFAULT 0 CHECK (watched_time >= 0),
+    event_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id                  BIGSERIAL PRIMARY KEY,
+    user_id             BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    action              TEXT NOT NULL CHECK (action IN ('view_course', 'play_video', 'buy_course', 'enroll_course', 'complete_course', 'login', 'logout', 'wallet_topup', 'admin_refund')),
+    ref_type            TEXT,
+    ref_id              BIGINT,
+    metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- =========================
+-- INDEXES
+-- =========================
+CREATE INDEX IF NOT EXISTS idx_courses_instructor_id ON courses(instructor_id);
+CREATE INDEX IF NOT EXISTS idx_courses_status ON courses(status);
+CREATE INDEX IF NOT EXISTS idx_lessons_section_id ON lessons(section_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_course_id ON order_items(course_id);
+CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id);
+CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+CREATE INDEX IF NOT EXISTS idx_payment_refunds_payment_status ON payment_refunds(payment_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_user_status ON wallet_topups(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_ref ON wallet_transactions(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_enrollments_user_course ON enrollments(user_id, course_id);
+CREATE INDEX IF NOT EXISTS idx_lesson_progress_user_lesson ON lesson_progress(user_id, lesson_id);
+CREATE INDEX IF NOT EXISTS idx_course_progress_user_course ON course_progress(user_id, course_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_course_id ON reviews(course_id);
+CREATE INDEX IF NOT EXISTS idx_watch_history_user_lesson ON watch_history(user_id, lesson_id);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_user_action_created ON activity_logs(user_id, action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_action_created ON activity_logs(action, created_at DESC);
+
+-- =========================
+-- FUNCTIONS + TRIGGERS
+-- =========================
+
+-- [A] Ensure course is publishable
+CREATE OR REPLACE FUNCTION fn_validate_course_publish()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_lessons_count INT;
+BEGIN
+    IF NEW.status = 'published' AND COALESCE(OLD.status, 'draft') <> 'published' THEN
+        SELECT COUNT(*) INTO v_lessons_count
+        FROM lessons l
+        JOIN course_sections cs ON cs.id = l.section_id
+        WHERE cs.course_id = NEW.id
+          AND l.deleted_at IS NULL;
+
+        IF v_lessons_count = 0 THEN
+            RAISE EXCEPTION 'Cannot publish course % without lessons', NEW.id;
+        END IF;
+
+        IF NEW.published_at IS NULL THEN
+            NEW.published_at := NOW();
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_validate_course_publish ON courses;
+CREATE TRIGGER trg_validate_course_publish
+BEFORE UPDATE OF status ON courses
+FOR EACH ROW
+EXECUTE FUNCTION fn_validate_course_publish();
+
+-- [B] Prevent duplicate purchase + optional auto-fill item price
+CREATE OR REPLACE FUNCTION fn_prevent_duplicate_purchase()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_user_id BIGINT;
+    v_course_price NUMERIC(12,2);
+BEGIN
+    SELECT o.user_id INTO v_user_id
+    FROM orders o
+    WHERE o.id = NEW.order_id;
+
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Order % does not exist.', NEW.order_id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM enrollments e
+        WHERE e.user_id = v_user_id
+          AND e.course_id = NEW.course_id
+    ) THEN
+        RAISE EXCEPTION 'User % already enrolled in course %', v_user_id, NEW.course_id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE o.user_id = v_user_id
+          AND oi.course_id = NEW.course_id
+          AND o.status IN ('pending', 'paid')
+    ) THEN
+        RAISE EXCEPTION 'User % already has course % in another pending/paid order', v_user_id, NEW.course_id;
+    END IF;
+
+    IF NEW.price IS NULL OR NEW.price = 0 THEN
+        SELECT c.price INTO v_course_price
+        FROM courses c
+        WHERE c.id = NEW.course_id
+          AND c.deleted_at IS NULL;
+
+        IF v_course_price IS NULL THEN
+            RAISE EXCEPTION 'Course % not found or deleted', NEW.course_id;
+        END IF;
+
+        NEW.price := v_course_price;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_prevent_duplicate_purchase ON order_items;
+CREATE TRIGGER trg_prevent_duplicate_purchase
+BEFORE INSERT ON order_items
+FOR EACH ROW
+EXECUTE FUNCTION fn_prevent_duplicate_purchase();
+
+-- [C] Keep order totals consistent
+CREATE OR REPLACE FUNCTION fn_recalculate_order_totals()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_order_id BIGINT;
+    v_subtotal NUMERIC(12,2);
+    v_discount_percent NUMERIC(5,2);
+    v_discount NUMERIC(12,2);
+BEGIN
+    v_order_id := COALESCE(NEW.order_id, OLD.order_id);
+
+    SELECT COALESCE(SUM(price), 0)
+    INTO v_subtotal
+    FROM order_items
+    WHERE order_id = v_order_id;
+
+    SELECT c.discount_percent
+    INTO v_discount_percent
+    FROM orders o
+    LEFT JOIN coupons c ON c.id = o.coupon_id
+    WHERE o.id = v_order_id;
+
+    v_discount := ROUND(v_subtotal * COALESCE(v_discount_percent, 0) / 100.0, 2);
+
+    UPDATE orders
+    SET subtotal_amount = v_subtotal,
+        discount_amount = v_discount,
+        total_amount = v_subtotal - v_discount,
+        updated_at = NOW()
+    WHERE id = v_order_id;
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_recalculate_order_totals ON order_items;
+CREATE TRIGGER trg_recalculate_order_totals
+AFTER INSERT OR UPDATE OR DELETE ON order_items
+FOR EACH ROW
+EXECUTE FUNCTION fn_recalculate_order_totals();
+
+-- [D] Protect payment state transition
+CREATE OR REPLACE FUNCTION fn_validate_payment_transition()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'failed' AND NEW.status IN ('paid', 'partial_refunded', 'refunded') THEN
+            RAISE EXCEPTION 'Payment state transition from failed is not allowed';
+        END IF;
+
+        IF OLD.status = 'refunded' AND NEW.status <> 'refunded' THEN
+            RAISE EXCEPTION 'Payment state transition from refunded is not allowed';
+        END IF;
+
+        IF OLD.status = 'partial_refunded' AND NEW.status = 'pending' THEN
+            RAISE EXCEPTION 'Payment state transition partial_refunded -> pending is not allowed';
+        END IF;
+
+        IF OLD.status = 'partial_refunded' AND NEW.status = 'paid' THEN
+            RAISE EXCEPTION 'Payment state transition partial_refunded -> paid is not allowed';
+        END IF;
+
+        IF OLD.status = 'paid' AND NEW.status = 'pending' THEN
+            RAISE EXCEPTION 'Payment state transition paid -> pending is not allowed';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fn_validate_refund_transition()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'processed' AND NEW.status <> 'processed' THEN
+            RAISE EXCEPTION 'Refund state transition from processed is not allowed';
+        END IF;
+
+        IF OLD.status = 'rejected' AND NEW.status <> 'rejected' THEN
+            RAISE EXCEPTION 'Refund state transition from rejected is not allowed';
+        END IF;
+
+        IF OLD.status = 'pending' AND NEW.status NOT IN ('approved', 'rejected', 'pending') THEN
+            RAISE EXCEPTION 'Refund transition pending -> % is not allowed', NEW.status;
+        END IF;
+
+        IF OLD.status = 'approved' AND NEW.status NOT IN ('approved', 'processed') THEN
+            RAISE EXCEPTION 'Refund transition approved -> % is not allowed', NEW.status;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fn_process_admin_refund()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_payment RECORD;
+    v_order RECORD;
+    v_wallet_id BIGINT;
+    v_balance_before NUMERIC(14,2);
+    v_balance_after NUMERIC(14,2);
+    v_refunded_before NUMERIC(12,2);
+    v_refunded_after NUMERIC(12,2);
+    v_remaining_amount NUMERIC(12,2);
+    v_payment_status TEXT;
+    v_coupon_id BIGINT;
+BEGIN
+    IF NEW.status <> 'approved' THEN
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status = 'approved' THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.approved_by IS NULL THEN
+        RAISE EXCEPTION 'Admin refund requires approved_by';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = NEW.approved_by
+          AND r.name = 'admin'
+    ) THEN
+        RAISE EXCEPTION 'approved_by user % is not admin', NEW.approved_by;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = NEW.requested_by
+    ) THEN
+        RAISE EXCEPTION 'requested_by user % does not exist', NEW.requested_by;
+    END IF;
+
+    SELECT p.* INTO v_payment
+    FROM payments p
+    WHERE p.id = NEW.payment_id
+    FOR UPDATE;
+
+    IF v_payment.id IS NULL THEN
+        RAISE EXCEPTION 'Payment % not found for refund', NEW.payment_id;
+    END IF;
+
+    IF v_payment.status NOT IN ('paid', 'partial_refunded') THEN
+        RAISE EXCEPTION 'Only paid or partial_refunded payment can be refunded. Current status: %', v_payment.status;
+    END IF;
+
+    SELECT o.* INTO v_order
+    FROM orders o
+    WHERE o.id = v_payment.order_id
+    FOR UPDATE;
+
+    IF v_order.id IS NULL THEN
+        RAISE EXCEPTION 'Order not found for payment %', v_payment.id;
+    END IF;
+
+    IF NEW.requested_by <> v_order.user_id AND NOT EXISTS (
+        SELECT 1
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = NEW.requested_by
+          AND r.name = 'admin'
+    ) THEN
+        RAISE EXCEPTION 'requested_by user % is not order owner/admin', NEW.requested_by;
+    END IF;
+
+    SELECT COALESCE(SUM(pr.amount), 0)
+    INTO v_refunded_before
+    FROM payment_refunds pr
+    WHERE pr.payment_id = NEW.payment_id
+      AND pr.status = 'processed';
+
+    v_refunded_after := v_refunded_before + NEW.amount;
+
+    IF v_refunded_after > v_payment.amount THEN
+        RAISE EXCEPTION 'Refund amount overflow: processed %, new %, payment total %', v_refunded_before, NEW.amount, v_payment.amount;
+    END IF;
+
+    v_remaining_amount := v_payment.amount - v_refunded_after;
+
+    IF v_remaining_amount = 0 THEN
+        v_payment_status := 'refunded';
+    ELSE
+        v_payment_status := 'partial_refunded';
+    END IF;
+
+    SELECT w.id, w.balance INTO v_wallet_id, v_balance_before
+    FROM wallets w
+    WHERE w.user_id = v_order.user_id
+      AND w.is_active = TRUE
+    FOR UPDATE;
+
+    IF v_wallet_id IS NULL THEN
+        RAISE EXCEPTION 'Active wallet not found for refund user %', v_order.user_id;
+    END IF;
+
+    UPDATE wallets
+    SET balance = balance + NEW.amount,
+        updated_at = NOW()
+    WHERE id = v_wallet_id;
+
+    v_balance_after := v_balance_before + NEW.amount;
+
+    INSERT INTO wallet_transactions(
+        wallet_id, tx_type, direction, amount, balance_before, balance_after,
+        status, ref_type, ref_id, description, created_at
+    )
+    VALUES (
+        v_wallet_id,
+        'refund',
+        'credit',
+        NEW.amount,
+        v_balance_before,
+        v_balance_after,
+        'success',
+        'payment_refund',
+        NEW.id,
+        CONCAT('Admin refund: ', NEW.reason),
+        NOW()
+    );
+
+    UPDATE payments
+    SET status = v_payment_status,
+        updated_at = NOW()
+    WHERE id = v_payment.id;
+
+    UPDATE orders
+    SET status = CASE WHEN v_payment_status = 'refunded' THEN 'refunded' ELSE 'partial_refunded' END,
+        updated_at = NOW()
+    WHERE id = v_order.id;
+
+    v_coupon_id := v_order.coupon_id;
+
+    IF NEW.refund_mode = 'revoke_access' THEN
+        DELETE FROM enrollments e
+        USING order_items oi
+        WHERE oi.order_id = v_order.id
+          AND e.user_id = v_order.user_id
+          AND e.course_id = oi.course_id;
+
+                DELETE FROM lesson_progress lp
+                USING lessons l, course_sections cs, order_items oi
+                WHERE lp.user_id = v_order.user_id
+                    AND lp.lesson_id = l.id
+                    AND l.section_id = cs.id
+                    AND cs.course_id = oi.course_id
+                    AND oi.order_id = v_order.id;
+
+                DELETE FROM course_progress cp
+                USING order_items oi
+                WHERE cp.user_id = v_order.user_id
+                    AND cp.course_id = oi.course_id
+                    AND oi.order_id = v_order.id;
+
+                DELETE FROM reviews r
+                USING order_items oi
+                WHERE r.user_id = v_order.user_id
+                    AND r.course_id = oi.course_id
+                    AND oi.order_id = v_order.id;
+
+                DELETE FROM watch_history wh
+                USING lessons l, course_sections cs, order_items oi
+                WHERE wh.user_id = v_order.user_id
+                    AND wh.lesson_id = l.id
+                    AND l.section_id = cs.id
+                    AND cs.course_id = oi.course_id
+                    AND oi.order_id = v_order.id;
+    END IF;
+
+        DELETE FROM instructor_earnings
+        WHERE payment_id = v_payment.id;
+
+        IF v_remaining_amount > 0 THEN
+                INSERT INTO instructor_earnings (instructor_id, payment_id, course_id, amount, system_amount, created_at)
+                SELECT
+                        c.instructor_id,
+                        v_payment.id,
+                        oi.course_id,
+                        ROUND((v_remaining_amount * oi.price / NULLIF(v_payment.amount, 0)) * 0.70, 2),
+                        ROUND((v_remaining_amount * oi.price / NULLIF(v_payment.amount, 0)) * 0.30, 2),
+                        NOW()
+                FROM order_items oi
+                JOIN courses c ON c.id = oi.course_id
+                WHERE oi.order_id = v_order.id;
+        END IF;
+
+    UPDATE payment_refunds
+    SET status = 'processed',
+        processed_at = NOW(),
+        updated_at = NOW()
+    WHERE id = NEW.id;
+
+    IF v_payment_status = 'refunded' AND v_coupon_id IS NOT NULL THEN
+        UPDATE coupons
+        SET used_count = GREATEST(used_count - 1, 0),
+            updated_at = NOW()
+        WHERE id = v_coupon_id;
+    END IF;
+
+    INSERT INTO activity_logs(user_id, action, ref_type, ref_id, metadata, created_at)
+    VALUES (
+        v_order.user_id,
+        'admin_refund',
+        'payment_refund',
+        NEW.id,
+        jsonb_build_object(
+            'payment_id', v_payment.id,
+            'amount', NEW.amount,
+            'refund_mode', NEW.refund_mode,
+            'approved_by', NEW.approved_by,
+            'requested_by', NEW.requested_by,
+            'payment_status_after', v_payment_status
+        ),
+        NOW()
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_validate_refund_transition ON payment_refunds;
+CREATE TRIGGER trg_validate_refund_transition
+BEFORE UPDATE OF status ON payment_refunds
+FOR EACH ROW
+EXECUTE FUNCTION fn_validate_refund_transition();
+
+DROP TRIGGER IF EXISTS trg_process_admin_refund ON payment_refunds;
+CREATE TRIGGER trg_process_admin_refund
+AFTER INSERT OR UPDATE OF status ON payment_refunds
+FOR EACH ROW
+EXECUTE FUNCTION fn_process_admin_refund();
+
+DROP TRIGGER IF EXISTS trg_validate_payment_transition ON payments;
+CREATE TRIGGER trg_validate_payment_transition
+BEFORE UPDATE OF status ON payments
+FOR EACH ROW
+EXECUTE FUNCTION fn_validate_payment_transition();
+
+-- [E] Auto enroll + revenue share + buy log when payment is paid
+CREATE OR REPLACE FUNCTION fn_handle_payment_paid()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_user_id BIGINT;
+    v_coupon_id BIGINT;
+BEGIN
+    IF NEW.status <> 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status = 'paid' THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT o.user_id, o.coupon_id INTO v_user_id, v_coupon_id
+    FROM orders o
+    WHERE o.id = NEW.order_id
+    FOR UPDATE;
+
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Order % not found for payment %', NEW.order_id, NEW.id;
+    END IF;
+
+    UPDATE orders
+    SET status = 'paid',
+        paid_at = COALESCE(NEW.paid_at, NOW()),
+        updated_at = NOW()
+    WHERE id = NEW.order_id;
+
+    IF NEW.paid_at IS NULL THEN
+        UPDATE payments
+        SET paid_at = NOW(),
+            updated_at = NOW()
+        WHERE id = NEW.id;
+    END IF;
+
+    IF v_coupon_id IS NOT NULL THEN
+        UPDATE coupons
+        SET used_count = used_count + 1,
+            updated_at = NOW()
+        WHERE id = v_coupon_id
+          AND is_active = TRUE
+          AND expiry_date > NOW()
+          AND (max_uses IS NULL OR used_count < max_uses);
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Coupon % is invalid, expired or max uses reached', v_coupon_id;
+        END IF;
+    END IF;
+
+    INSERT INTO enrollments (user_id, course_id, enrolled_at, source)
+    SELECT v_user_id, oi.course_id, NOW(), 'payment'
+    FROM order_items oi
+    WHERE oi.order_id = NEW.order_id
+    ON CONFLICT (user_id, course_id) DO NOTHING;
+
+    INSERT INTO instructor_earnings (instructor_id, payment_id, course_id, amount, system_amount, created_at)
+    SELECT
+        c.instructor_id,
+        NEW.id,
+        oi.course_id,
+        ROUND(oi.price * 0.70, 2),
+        ROUND(oi.price * 0.30, 2),
+        NOW()
+    FROM order_items oi
+    JOIN courses c ON c.id = oi.course_id
+    WHERE oi.order_id = NEW.order_id
+    ON CONFLICT (payment_id, course_id) DO NOTHING;
+
+    INSERT INTO activity_logs(user_id, action, ref_type, ref_id, metadata, created_at)
+    VALUES (
+        v_user_id,
+        'buy_course',
+        'order',
+        NEW.order_id,
+        jsonb_build_object('payment_id', NEW.id, 'amount', NEW.amount),
+        NOW()
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_handle_payment_paid ON payments;
+CREATE TRIGGER trg_handle_payment_paid
+AFTER INSERT OR UPDATE OF status ON payments
+FOR EACH ROW
+EXECUTE FUNCTION fn_handle_payment_paid();
+
+-- [F] Ensure lesson_progress only for enrolled user + set completed_at
+CREATE OR REPLACE FUNCTION fn_validate_lesson_progress()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_course_id BIGINT;
+BEGIN
+    SELECT cs.course_id INTO v_course_id
+    FROM lessons l
+    JOIN course_sections cs ON cs.id = l.section_id
+    WHERE l.id = NEW.lesson_id;
+
+    IF v_course_id IS NULL THEN
+        RAISE EXCEPTION 'Lesson % not found', NEW.lesson_id;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM enrollments e
+        WHERE e.user_id = NEW.user_id
+          AND e.course_id = v_course_id
+    ) THEN
+        RAISE EXCEPTION 'User % is not enrolled in course %', NEW.user_id, v_course_id;
+    END IF;
+
+    IF NEW.is_completed = TRUE AND (TG_OP = 'INSERT' OR OLD.is_completed = FALSE) THEN
+        NEW.completed_at := COALESCE(NEW.completed_at, NOW());
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_validate_lesson_progress ON lesson_progress;
+CREATE TRIGGER trg_validate_lesson_progress
+BEFORE INSERT OR UPDATE OF is_completed, lesson_id, user_id ON lesson_progress
+FOR EACH ROW
+EXECUTE FUNCTION fn_validate_lesson_progress();
+
+-- [G] Auto update course progress on lesson progress change
+CREATE OR REPLACE FUNCTION fn_update_course_progress()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_course_id BIGINT;
+    v_total_lessons INT;
+    v_completed_lessons INT;
+    v_percent NUMERIC(5,2);
+BEGIN
+    SELECT cs.course_id INTO v_course_id
+    FROM lessons l
+    JOIN course_sections cs ON cs.id = l.section_id
+    WHERE l.id = NEW.lesson_id;
+
+    IF v_course_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT COUNT(*) INTO v_total_lessons
+    FROM lessons l
+    JOIN course_sections cs ON cs.id = l.section_id
+    WHERE cs.course_id = v_course_id
+      AND l.deleted_at IS NULL;
+
+    IF v_total_lessons = 0 THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT COUNT(*) INTO v_completed_lessons
+    FROM lesson_progress lp
+    JOIN lessons l ON l.id = lp.lesson_id
+    JOIN course_sections cs ON cs.id = l.section_id
+    WHERE lp.user_id = NEW.user_id
+      AND lp.is_completed = TRUE
+      AND cs.course_id = v_course_id
+      AND l.deleted_at IS NULL;
+
+    v_percent := ROUND((v_completed_lessons::NUMERIC * 100.0) / v_total_lessons, 2);
+
+    INSERT INTO course_progress(user_id, course_id, progress_percent, created_at, updated_at)
+    VALUES (NEW.user_id, v_course_id, v_percent, NOW(), NOW())
+    ON CONFLICT (user_id, course_id)
+    DO UPDATE SET
+        progress_percent = EXCLUDED.progress_percent,
+        updated_at = NOW();
+
+    IF v_percent >= 100 THEN
+        INSERT INTO activity_logs(user_id, action, ref_type, ref_id, metadata, created_at)
+        VALUES (
+            NEW.user_id,
+            'complete_course',
+            'course',
+            v_course_id,
+            jsonb_build_object('progress_percent', v_percent),
+            NOW()
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_course_progress ON lesson_progress;
+CREATE TRIGGER trg_update_course_progress
+AFTER INSERT OR UPDATE OF is_completed ON lesson_progress
+FOR EACH ROW
+EXECUTE FUNCTION fn_update_course_progress();
+
+-- [H] Recalculate course and instructor average rating
+CREATE OR REPLACE FUNCTION fn_refresh_ratings()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_course_id BIGINT;
+    v_instructor_id BIGINT;
+BEGIN
+    v_course_id := COALESCE(NEW.course_id, OLD.course_id);
+
+    UPDATE courses c
+    SET rating_avg = COALESCE((
+        SELECT ROUND(AVG(r.rating)::NUMERIC, 2)
+        FROM reviews r
+        WHERE r.course_id = v_course_id
+    ), 0),
+        updated_at = NOW()
+    WHERE c.id = v_course_id;
+
+    SELECT c.instructor_id INTO v_instructor_id
+    FROM courses c
+    WHERE c.id = v_course_id;
+
+    IF v_instructor_id IS NOT NULL THEN
+        UPDATE instructor_profiles ip
+        SET rating_avg = COALESCE((
+            SELECT ROUND(AVG(r.rating)::NUMERIC, 2)
+            FROM reviews r
+            JOIN courses c ON c.id = r.course_id
+            WHERE c.instructor_id = v_instructor_id
+        ), 0),
+            updated_at = NOW()
+        WHERE ip.user_id = v_instructor_id;
+    END IF;
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_refresh_ratings ON reviews;
+CREATE TRIGGER trg_refresh_ratings
+AFTER INSERT OR UPDATE OR DELETE ON reviews
+FOR EACH ROW
+EXECUTE FUNCTION fn_refresh_ratings();
+
+-- [I] Log enroll event
+CREATE OR REPLACE FUNCTION fn_log_enrollment_activity()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO activity_logs(user_id, action, ref_type, ref_id, metadata, created_at)
+    VALUES (
+        NEW.user_id,
+        'enroll_course',
+        'course',
+        NEW.course_id,
+        jsonb_build_object('source', NEW.source),
+        NOW()
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_log_enrollment_activity ON enrollments;
+CREATE TRIGGER trg_log_enrollment_activity
+AFTER INSERT ON enrollments
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_enrollment_activity();
+
+-- [J] Log watch/play event
+CREATE OR REPLACE FUNCTION fn_log_watch_activity()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO activity_logs(user_id, action, ref_type, ref_id, metadata, created_at)
+    VALUES (
+        NEW.user_id,
+        'play_video',
+        'lesson',
+        NEW.lesson_id,
+        jsonb_build_object('watched_time', NEW.watched_time, 'event_at', NEW.event_at),
+        NOW()
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_log_watch_activity ON watch_history;
+CREATE TRIGGER trg_log_watch_activity
+AFTER INSERT ON watch_history
+FOR EACH ROW
+EXECUTE FUNCTION fn_log_watch_activity();
+
+-- [K] Auto create quiz attempt when answering starts
+CREATE OR REPLACE FUNCTION fn_auto_create_quiz_attempt()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_attempt_id BIGINT;
+BEGIN
+    IF NEW.attempt_id IS NULL THEN
+        INSERT INTO quiz_attempts(user_id, quiz_id, score, started_at, created_at)
+        VALUES (NEW.user_id, NEW.quiz_id, 0, NOW(), NOW())
+        RETURNING id INTO v_attempt_id;
+
+        NEW.attempt_id := v_attempt_id;
+    ELSE
+        IF NOT EXISTS (
+            SELECT 1
+            FROM quiz_attempts qa
+            WHERE qa.id = NEW.attempt_id
+              AND qa.user_id = NEW.user_id
+              AND qa.quiz_id = NEW.quiz_id
+        ) THEN
+            RAISE EXCEPTION 'Invalid attempt_id % for user % and quiz %', NEW.attempt_id, NEW.user_id, NEW.quiz_id;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_auto_create_quiz_attempt ON attempt_answers;
+CREATE TRIGGER trg_auto_create_quiz_attempt
+BEFORE INSERT ON attempt_answers
+FOR EACH ROW
+EXECUTE FUNCTION fn_auto_create_quiz_attempt();
+
+COMMIT;
