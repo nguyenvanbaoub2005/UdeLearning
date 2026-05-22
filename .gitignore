@@ -24,6 +24,7 @@ frontend/dist-ssr/
 frontend/*.local
 frontend/vite.config.js.timestamp-*
 frontend/.gitignore
+frontend/vite.config.js
 
 # --- BACKEND (FastAPI/Python) ---
 backend/venv/

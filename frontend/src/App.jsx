@@ -5,188 +5,201 @@ function App() {
   const [keyword, setKeyword] = useState('');
   const [courses, setCourses] = useState([]);
   const [users, setUsers] = useState([]);
-  const [activeUserId, setActiveUserId] = useState(3); // Default to user 3 (Văn Bảo)
+  const [activeUserId, setActiveUserId] = useState(3);
   const [walletBalance, setWalletBalance] = useState(0);
   const [message, setMessage] = useState('');
-
-  // Registration form state
+  const [cartItems, setCartItems] = useState([]);
+  const [cartSubtotal, setCartSubtotal] = useState(0);
   const [newFullName, setNewFullName] = useState('');
   const [newEmail, setNewEmail] = useState('');
+  const [logs, setLogs] = useState([]);
+  const debounceTimeout = useRef(null);
 
-  // Fetch all users
+  const showMessage = (text, duration = 5000) => {
+    setMessage(text);
+    setTimeout(() => setMessage(''), duration);
+  };
+  const addLog = (text) => {
+    const time = new Date().toLocaleTimeString('vi-VN');
+    setLogs(prev => [`[${time}] ${text}`, ...prev].slice(0, 20));
+  };
   const fetchUsers = async () => {
     try {
       const res = await fetch('http://127.0.0.1:8000/api/users/list');
       const data = await res.json();
-      if (data.success) {
-        setUsers(data.users);
-      }
+      if (data.success) setUsers(data.users);
     } catch (err) {
-      console.error("Lỗi lấy danh sách người dùng:", err);
+      console.error('Lỗi lấy danh sách người dùng:', err);
     }
   };
 
-  // Fetch wallet balance
   const fetchWalletBalance = async (uid) => {
+    addLog(`SELECT * FROM wallets WHERE user_id = ${uid}`);
     try {
       const res = await fetch(`http://127.0.0.1:8000/api/wallets/balance/${uid}`);
       const data = await res.json();
-      if (data.success) {
-        setWalletBalance(data.balance);
-      } else {
-        setWalletBalance(0);
-      }
+      setWalletBalance(data.success ? data.balance : 0);
     } catch (err) {
-      console.error("Lỗi lấy số dư ví:", err);
+      console.error('Lỗi lấy số dư ví:', err);
       setWalletBalance(0);
     }
   };
 
-  // 1. Search API Call
-  // Using a ref to debounce search requests
-  const debounceTimeout = useRef(null);
+  const fetchCart = async (uid = activeUserId) => {
+    addLog(`SELECT ci.*, c.title FROM cart_items ci JOIN carts cart ON ci.cart_id = cart.id JOIN courses c ON c.id = ci.course_id WHERE cart.user_id = ${uid}`);
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/cart/${uid}`);
+      const data = await res.json();
+
+      if (data.success) {
+        setCartItems(data.items || []);
+        setCartSubtotal(data.subtotal || 0);
+      } else {
+        setCartItems([]);
+        setCartSubtotal(0);
+      }
+    } catch (err) {
+      console.error('Lỗi lấy giỏ hàng:', err);
+      setCartItems([]);
+      setCartSubtotal(0);
+    }
+  };
 
   const handleSearch = (e) => {
     const val = e.target.value;
+    addLog(`SELECT * FROM courses WHERE keyword LIKE '%${val}%'`);
     setKeyword(val);
 
-    if (debounceTimeout.current) {
-      clearTimeout(debounceTimeout.current);
-    }
+    if (debounceTimeout.current) clearTimeout(debounceTimeout.current);
 
     debounceTimeout.current = setTimeout(async () => {
       try {
-        const res = await fetch(`http://127.0.0.1:8000/api/courses/search?keyword=${val}`);
+        const res = await fetch(
+          `http://127.0.0.1:8000/api/courses/search?keyword=${encodeURIComponent(val)}`
+        );
         const data = await res.json();
-        if (data.success) {
-          setCourses(data.data);
-        }
+        if (data.success) setCourses(data.data);
       } catch (err) {
         console.error(err);
       }
-    }, 300); // 300ms delay
+    }, 300);
   };
 
-  // 2. Initial Load
   useEffect(() => {
     handleSearch({ target: { value: '' } });
     fetchUsers();
     fetchWalletBalance(activeUserId);
+    fetchCart(activeUserId);
   }, []);
 
-  // 3. Update active user
   const handleUserChange = (e) => {
-    const uid = parseInt(e.target.value);
+    const uid = parseInt(e.target.value, 10);
+    addLog(`SWITCH USER -> user_id = ${uid}`);
     setActiveUserId(uid);
     fetchWalletBalance(uid);
+    fetchCart(uid);
   };
 
-  // 4. Register new user (triggers auto wallet creation in Postgres)
   const handleRegister = async (e) => {
     e.preventDefault();
+    addLog(`INSERT INTO users(email, full_name) VALUES ('${newEmail}', '${newFullName}') -> trigger tạo wallet`);
+
     if (!newFullName || !newEmail) {
-      alert("Vui lòng điền đầy đủ Tên và Email!");
+      alert('Vui lòng điền đầy đủ Tên và Email!');
       return;
     }
 
     try {
       const res = await fetch('http://127.0.0.1:8000/api/users/register', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          email: newEmail,
-          full_name: newFullName
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: newEmail, full_name: newFullName }),
       });
 
       const data = await res.json();
 
       if (data.success) {
-        setMessage(data.message);
+        showMessage(data.message);
         setNewFullName('');
         setNewEmail('');
-        await fetchUsers(); // Tải lại danh sách user
-        setActiveUserId(data.user.id); // Tự động switch sang user mới tạo
+        await fetchUsers();
+        setActiveUserId(data.user.id);
         fetchWalletBalance(data.user.id);
+        fetchCart(data.user.id);
       } else {
-        setMessage(`Lỗi đăng ký: ${data.message}`);
+        showMessage(`Lỗi đăng ký: ${data.message}`);
       }
-
-      setTimeout(() => setMessage(''), 5000);
-
     } catch (err) {
       console.error(err);
-      setMessage("Lỗi kết nối đến Backend!");
+      showMessage('Lỗi kết nối đến Backend!');
     }
   };
 
-  // 5. Payment API Call
-  const handlePayment = async (courseId, price) => {
+  const handleAddToCart = async (courseId) => {
+    addLog(`INSERT INTO cart_items(cart_id, course_id, quantity, unit_price) SELECT cart.id, ${courseId}, 1, courses.price WHERE user_id = ${activeUserId}`);
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/wallets/pay', {
+      const res = await fetch('http://127.0.0.1:8000/api/cart/add', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          course_id: courseId,
-          price: price,
-          user_id: activeUserId
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: activeUserId, course_id: courseId }),
+      });
+
+      const data = await res.json();
+      showMessage(data.message || 'Đã thêm vào giỏ hàng.');
+
+      if (data.success) fetchCart(activeUserId);
+    } catch (err) {
+      console.error(err);
+      showMessage('Lỗi kết nối đến Backend!');
+    }
+  };
+
+  const handleCheckoutCart = async () => {
+    addLog(`CHECKOUT user_id=${activeUserId}: INSERT orders -> order_items -> payments(status='paid') -> triggers trừ ví/enroll/chia tiền`);
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/cart/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: activeUserId }),
       });
 
       const data = await res.json();
 
       if (data.success) {
-        setMessage(data.message);
+        const total = Number(data.total_amount || cartSubtotal);
+        showMessage(`Thanh toán thành công ${total.toLocaleString('vi-VN')} đ`);
         fetchWalletBalance(activeUserId);
+        fetchCart(activeUserId);
       } else {
-        setMessage(`Lỗi từ DB Trigger: ${data.message}`);
+        showMessage(data.message || 'Thanh toán thất bại.');
       }
-
-      setTimeout(() => {
-        setMessage('');
-      }, 5000);
-
     } catch (err) {
       console.error(err);
-      setMessage("Lỗi kết nối đến Backend!");
+      showMessage('Lỗi kết nối đến Backend!');
     }
   };
 
-  // 6. Topup API Call
   const handleTopup = async () => {
     try {
       const amount = 200000;
+      addLog(`INSERT INTO wallet_topups(user_id=${activeUserId}, amount=${amount}, status='paid') -> trigger cộng tiền ví`);
       const res = await fetch('http://127.0.0.1:8000/api/wallets/topup', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          user_id: activeUserId,
-          amount: amount
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: activeUserId, amount }),
       });
 
       const data = await res.json();
 
       if (data.success) {
-        setMessage(data.message);
+        showMessage(data.message, 3000);
         fetchWalletBalance(activeUserId);
       } else {
-        setMessage("Nạp tiền thất bại.");
+        showMessage('Nạp tiền thất bại.', 3000);
       }
-
-      setTimeout(() => {
-        setMessage('');
-      }, 3000);
-
     } catch (err) {
       console.error(err);
-      setMessage("Lỗi kết nối đến Backend!");
+      showMessage('Lỗi kết nối đến Backend!');
     }
   };
 
@@ -195,10 +208,16 @@ function App() {
       <header className="ude-header">
         <div className="header-left">
           <h1>UdeLearning Showcase</h1>
+
           <div className="user-selector-container">
             <label htmlFor="user-select">Chọn tài khoản: </label>
-            <select id="user-select" value={activeUserId} onChange={handleUserChange} className="user-select">
-              {users.map(u => (
+            <select
+              id="user-select"
+              value={activeUserId}
+              onChange={handleUserChange}
+              className="user-select"
+            >
+              {users.map((u) => (
                 <option key={u.id} value={u.id}>
                   {u.full_name} ({u.email})
                 </option>
@@ -206,23 +225,29 @@ function App() {
             </select>
           </div>
         </div>
+
         <div className="wallet-card-container">
           <div className="wallet-card">
             <span>Ví: </span>
-            <strong>{walletBalance.toLocaleString('vi-VN')} VND</strong>
+            <strong>{Number(walletBalance).toLocaleString('vi-VN')} VND</strong>
           </div>
+
           <button onClick={handleTopup} className="topup-btn">
             Nạp 200K (Trigger)
           </button>
         </div>
       </header>
 
-      {message && <div className={`message-toast ${message.includes('Lỗi') || message.includes('thất bại') ? 'error' : 'success'}`}>{message}</div>}
+      {message && (
+        <div className={`message-toast ${message.includes('Lỗi') || message.includes('thất bại') ? 'error' : 'success'}`}>
+          {message}
+        </div>
+      )}
 
       <div className="showcase-grid">
         <div className="main-content">
           <section className="search-section">
-            <h2>Nhập để tìm kiếm khoá học </h2>
+            <h2>Nhập để tìm kiếm khoá học</h2>
 
             <input
               type="text"
@@ -235,18 +260,26 @@ function App() {
 
           <section className="courses-section">
             <h2>Danh sách khóa học</h2>
+
             <div className="courses-grid">
               {courses.length === 0 ? (
                 <p>Không tìm thấy khóa học nào.</p>
               ) : (
-                courses.map(course => (
+                courses.map((course) => (
                   <div key={course.id} className="course-card">
                     <h3>{course.title}</h3>
                     <p className="desc">{course.description}</p>
+
                     <div className="course-footer">
-                      <span className="price">{Number(course.price).toLocaleString('vi-VN')} đ</span>
-                      <button onClick={() => handlePayment(course.id, course.price)} className="buy-btn">
-                        Mua ngay
+                      <span className="price">
+                        {Number(course.price).toLocaleString('vi-VN')} đ
+                      </span>
+
+                      <button
+                        onClick={() => handleAddToCart(course.id)}
+                        className="buy-btn"
+                      >
+                        Thêm vào giỏ
                       </button>
                     </div>
                   </div>
@@ -258,40 +291,96 @@ function App() {
 
         <aside className="sidebar">
           <section className="register-section">
+            <h3>Giỏ hàng của user #{activeUserId}</h3>
+
+            {cartItems.length === 0 ? (
+              <p>Giỏ hàng trống.</p>
+            ) : (
+              <>
+                {cartItems.map((item) => (
+                  <div
+                    key={item.cart_item_id}
+                    className="cart-item"
+                    style={{ color: 'white', marginBottom: '12px' }}
+                  >
+                    <b>{item.title}</b>
+                    <p>
+                      {Number(item.unit_price).toLocaleString('vi-VN')} đ
+                      {item.quantity > 1 ? ` x ${item.quantity}` : ''}
+                    </p>
+                  </div>
+                ))}
+
+                <h4>
+                  Tổng: {Number(cartSubtotal).toLocaleString('vi-VN')} đ
+                </h4>
+
+                <button onClick={handleCheckoutCart} className="register-btn">
+                  Thanh toán giỏ hàng
+                </button>
+              </>
+            )}
+          </section>
+
+          <section className="register-section">
             <h3>Đăng ký Thành viên mới</h3>
-            <p className="register-subtitle">Demo Trigger tự động khởi tạo ví tiền khi insert User.</p>
+            <p className="register-subtitle">
+              Demo Trigger tự động khởi tạo ví tiền khi insert User.
+            </p>
+
             <form onSubmit={handleRegister} className="register-form">
               <input
                 type="text"
                 placeholder="Họ và tên..."
                 value={newFullName}
-                onChange={e => setNewFullName(e.target.value)}
+                onChange={(e) => setNewFullName(e.target.value)}
                 className="form-input"
                 required
               />
+
               <input
                 type="email"
                 placeholder="Email..."
                 value={newEmail}
-                onChange={e => setNewEmail(e.target.value)}
+                onChange={(e) => setNewEmail(e.target.value)}
                 className="form-input"
                 required
               />
-              <button type="submit" className="register-btn">Đăng ký ngay</button>
+
+              <button type="submit" className="register-btn">
+                Đăng ký ngay
+              </button>
             </form>
           </section>
 
           <div className="trigger-note">
+            <strong>SQL / Trigger Log:</strong>
+
+            {logs.length === 0 ? (
+              <p>Chưa có thao tác nào.</p>
+            ) : (
+              <ul>
+                {logs.map((log, index) => (
+                  <li key={index}>
+                    <code>{log}</code>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="trigger-note">
             <strong>Chi tiết Demo DB: </strong>
+
             <ul>
               <li>
-                <strong>Trigger Đăng ký (Đơn giản):</strong> Khi insert người dùng mới, Trigger <code>trg_create_wallet_for_user</code> chạy <code>AFTER INSERT</code> tự động tạo một Ví trống (0 VND) trong bảng <code>wallets</code>. Bạn có thể đăng ký thử để kiểm tra ví tự động xuất hiện!
+                <strong>Đăng ký:</strong> Insert <code>users</code> → trigger tạo <code>wallets</code>.
               </li>
               <li>
-                <strong>Trigger Nạp tiền:</strong> Nhấn "Nạp 200K" tạo bản ghi <code>wallet_topups</code> ở trạng thái 'paid', kích hoạt <code>trg_apply_wallet_topup</code> tự cộng tiền vào ví.
+                <strong>Nạp tiền:</strong> Insert <code>wallet_topups</code> paid → trigger cộng ví.
               </li>
               <li>
-                <strong>Trigger Thanh toán & Phân chia (Phức tạp):</strong> Mua khóa học kích hoạt <code>trg_process_wallet_payment</code> (trừ tiền) và <code>trg_handle_payment_paid</code> (đăng ký học, chia doanh thu giảng viên 70/30, ghi log).
+                <strong>Checkout:</strong> Insert <code>orders</code>, <code>order_items</code>, <code>payments</code> → trigger trừ ví, enroll, chia tiền.
               </li>
             </ul>
           </div>
@@ -302,5 +391,3 @@ function App() {
 }
 
 export default App;
-
-

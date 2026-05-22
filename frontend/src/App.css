@@ -3,7 +3,8 @@
 body {
   margin: 0;
   font-family: 'Inter', sans-serif;
-  background-color: #0f172a; /* Slate 900 */
+  background-color: #0f172a;
+  /* Slate 900 */
   color: #f8fafc;
   -webkit-font-smoothing: antialiased;
 }
@@ -63,7 +64,8 @@ body {
 }
 
 .wallet-card strong {
-  color: #34d399; /* Emerald 400 */
+  color: #34d399;
+  /* Emerald 400 */
   margin-left: 0.5rem;
 }
 
@@ -305,3 +307,49 @@ body {
   color: #e0f2fe;
 }
 
+.cart-item {
+  color: #fff;
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.cart-item p {
+  margin: 6px 0 0;
+  color: #cbd5e1;
+}
+
+.cart-total {
+  color: #fff;
+  margin: 16px 0;
+  font-size: 18px;
+}
+
+.trigger-note {
+  margin-top: 20px;
+  padding: 16px;
+  border-radius: 14px;
+  background: #1e293b;
+  color: white;
+
+  max-height: 250px;
+  overflow-y: auto;
+
+  border: 1px solid #334155;
+}
+
+.trigger-note ul {
+  padding-left: 18px;
+}
+
+.trigger-note li {
+  margin-bottom: 10px;
+}
+
+.trigger-note code {
+  color: #67e8f9;
+  font-size: 12px;
+  word-break: break-word;
+}

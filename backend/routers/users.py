@@ -34,7 +34,7 @@ async def register_user(request: Request, payload: UserRegisterRequest):
 @router.get("/list")
 async def list_users(request: Request):
     pool = request.app.state.pool
-    query = "SELECT id, email, full_name FROM users ORDER BY id ASC LIMIT 20"
+    query = "SELECT id, email, full_name FROM users ORDER BY id ASC LIMIT 200"
     
     async with pool.acquire() as conn:
         records = await conn.fetch(query)
